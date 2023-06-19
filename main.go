@@ -1,8 +1,7 @@
 package main
 
 import (
-	"fmt"
-	"os"
+	"log"
 
 	"github.com/charmbracelet/bubbles/list"
 	"github.com/charmbracelet/bubbles/textarea"
@@ -24,8 +23,13 @@ const (
 /* MODEL MANAGEMENT */
 var models []tea.Model
 
+// edit constant
 const (
-	model status = iota
+	noEdit = -1
+)
+
+const (
+	board status = iota
 	form
 )
 
@@ -38,8 +42,6 @@ var (
 			Padding(1, 2).
 			Border(lipgloss.RoundedBorder()).
 			BorderForeground(lipgloss.Color("62"))
-	helpStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("241"))
 )
 
 /* CUSTOM ITEM */
@@ -78,19 +80,22 @@ func (t Task) Description() string {
 /* MAIN MODEL */
 
 type Model struct {
-	loaded   bool
-	focused  status
-	lists    []list.Model
-	err      error
-	quitting bool
+	loaded       bool
+	focused      status
+	lists        []list.Model
+	quitting     bool
+	editingIndex int
 }
 
 func New() *Model {
-	return &Model{}
+	return &Model{editingIndex: noEdit}
 }
 
 func (m *Model) MoveToNext() tea.Msg {
 	selectedItem := m.lists[m.focused].SelectedItem()
+	if selectedItem == nil { // will happen if board is empty
+		return nil
+	}
 	selectedTask := selectedItem.(Task)
 	m.lists[selectedTask.status].RemoveItem(m.lists[m.focused].Index())
 	selectedTask.Next()
@@ -122,11 +127,10 @@ func (m *Model) Prev() {
 	}
 }
 
-func (m *Model) initLists(width, height int) {
-	defaultList := list.New([]list.Item{}, list.NewDefaultDelegate(), width/divisor, height/2)
+func (m *Model) initLists() {
+	defaultList := list.New([]list.Item{}, list.NewDefaultDelegate(), 0, 0)
 	defaultList.SetShowHelp(false)
 	m.lists = []list.Model{defaultList, defaultList, defaultList}
-
 	// Init To Do
 	m.lists[todo].Title = "To Do"
 	m.lists[todo].SetItems([]list.Item{
@@ -153,14 +157,15 @@ func (m Model) Init() tea.Cmd {
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
-		if !m.loaded {
-			columnStyle.Width(msg.Width / divisor)
-			focusedStyle.Width(msg.Width / divisor)
-			columnStyle.Height(msg.Height - divisor)
-			focusedStyle.Height(msg.Height - divisor)
-			m.initLists(msg.Width, msg.Height)
-			m.loaded = true
+		columnStyle.Width(msg.Width / divisor)
+		focusedStyle.Width(msg.Width / divisor)
+		columnStyle.Height(msg.Height - divisor)
+		focusedStyle.Height(msg.Height - divisor)
+		for i, list := range m.lists {
+			list.SetSize(msg.Width/divisor, msg.Height/2)
+			m.lists[i], _ = list.Update(msg)
 		}
+		m.loaded = true
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "ctrl+c", "q":
@@ -173,15 +178,39 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "enter":
 			return m, m.MoveToNext
 		case "n":
-			models[model] = m // save the state of the current model
+			models[board] = m // save the state of the current model
 			models[form] = NewForm(m.focused)
+			return models[form].Update(nil)
+		case "e":
+			list := m.lists[m.focused]
+			if len(list.VisibleItems()) == 0 {
+				return m, nil
+			}
+
+			task := list.SelectedItem().(Task)
+			editForm := NewForm(m.focused)
+			editForm.title.SetValue(task.title)
+			editForm.description.SetValue(task.description)
+			m.editingIndex = list.Index()
+			models[board] = m // save the state of the current model
+			models[form] = editForm
 			return models[form].Update(nil)
 		case "d":
 			return m, m.DeleteCurrent
 		}
 	case Task:
 		task := msg
-		return m, m.lists[task.status].InsertItem(len(m.lists[task.status].Items()), task)
+		list := &m.lists[task.status]
+
+		// if edit, replace existing task in list
+		if m.editingIndex != noEdit {
+			index := m.editingIndex
+			m.editingIndex = noEdit
+			return m, list.SetItem(index, task)
+		}
+
+		// add task to end of list
+		return m, list.InsertItem(len(list.Items()), task)
 	}
 	var cmd tea.Cmd
 	m.lists[m.focused], cmd = m.lists[m.focused].Update(msg)
@@ -232,16 +261,20 @@ type Form struct {
 }
 
 func NewForm(focused status) *Form {
-	form := &Form{focused: focused}
-	form.title = textinput.New()
+	form := Form{
+		focused:     focused,
+		title:       textinput.New(),
+		description: textarea.New(),
+	}
+
 	form.title.Focus()
-	form.description = textarea.New()
-	return form
+	return &form
 }
 
 func (m Form) CreateTask() tea.Msg {
-	task := NewTask(m.focused, m.title.Value(), m.description.Value())
-	return task
+	return Task{
+		m.focused, m.title.Value(), m.description.Value(),
+	}
 }
 
 func (m Form) Init() tea.Cmd {
@@ -262,7 +295,7 @@ func (m Form) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, textarea.Blink
 			} else {
 				models[form] = m
-				return models[model], m.CreateTask
+				return models[board], m.CreateTask
 			}
 		}
 	}
@@ -280,11 +313,12 @@ func (m Form) View() string {
 }
 
 func main() {
-	models = []tea.Model{New(), NewForm(todo)}
-	m := models[model]
+	boardView := Model{}
+	boardView.initLists()
+	models = []tea.Model{&boardView, NewForm(todo)}
+	m := models[board]
 	p := tea.NewProgram(m)
 	if err := p.Start(); err != nil {
-		fmt.Println(err)
-		os.Exit(1)
+		log.Fatal(err)
 	}
 }
